@@ -217,8 +217,9 @@ All commands default to the current working directory as the project path. Use `
 | `copy`         | Copy conversations between workspaces (same machine)       | Yes                   |
 | `doctor`       | Audit chats: find orphaned/lost conversations, recover them | Yes (with `--recover`) |
 | `migrate`      | Migrate old chats to Cursor 3.0 global index                | Yes                   |
+| `purge`        | Delete chats from Cursor's DB to reclaim disk space          | Yes                   |
 
-Most of the time you only need `sync`. Use `push -s` when you want to push specific conversations. Use `repair` if you get "Blob not found" errors after importing. Use `doctor` to find and recover orphaned chats. Use `migrate` after updating to Cursor 3.0 to make all old chats visible in the sidebar. Use `delete` to clean up snapshots you no longer need.
+Most of the time you only need `sync`. Use `push -s` when you want to push specific conversations. Use `repair` if you get "Blob not found" errors after importing. Use `doctor` to find and recover orphaned chats. Use `migrate` after updating to Cursor 3.0 to make all old chats visible in the sidebar. Use `purge` to delete chats and reclaim disk space (requires Cursor to be closed). Use `delete` to clean up snapshots you no longer need.
 
 ### Auto-sync with `watch`
 

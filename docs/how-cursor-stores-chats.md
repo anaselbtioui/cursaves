@@ -217,6 +217,17 @@ As of v0.8.2, cursaves combines multiple sources for maximum coverage:
 
 `cursaves migrate` scans all workspaces for chats tracked in the old format that are missing from `composer.composerHeaders`, and adds them with the correct `workspaceIdentifier`. This makes old chats appear in Cursor 3.0's sidebar without needing to manually re-open each one. Use `--dry-run` to preview first.
 
+**Deletion (purge):**
+
+`cursaves purge` lists all chats with their key counts (a proxy for size), grouped by workspace. You can select individual chats by number, ranges, or all chats from a workspace. Deletion removes:
+- `composerData:{id}` — the chat metadata and conversation map
+- `bubbleId:{id}:*` — all message bubble entries (typically the bulk of storage)
+- `checkpointId:{id}:*` — agent checkpoint data
+- The chat's entry in `composer.composerHeaders` (global DB)
+- The chat's entry in `allComposers` / `selectedComposerIds` (workspace DB)
+
+After purging, run `sqlite3 '<global-db-path>' 'VACUUM;'` to actually reclaim the freed disk space. Cursor must be fully closed before purging.
+
 ## Conversation Data Structure
 
 Each `composerData:{UUID}` entry in the global DB is a JSON object with this structure:

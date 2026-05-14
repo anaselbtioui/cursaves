@@ -1706,6 +1706,156 @@ def cmd_doctor(args):
         )
 
 
+def cmd_purge(args):
+    """Delete chats from Cursor's database to reclaim space."""
+    from .importer import list_all_chats_with_sizes, purge_chats
+
+    force = getattr(args, "force", False)
+    ws_filter = getattr(args, "workspace", None)
+
+    print("\n  Scanning chats (this may take a moment)...\n")
+    all_chats = list_all_chats_with_sizes()
+
+    if not all_chats:
+        print("  No chats found.")
+        return
+
+    # Filter by workspace if requested
+    if ws_filter:
+        ws_filter_lower = ws_filter.lower()
+        all_chats = [
+            c for c in all_chats
+            if ws_filter_lower in c["workspace_label"].lower()
+        ]
+        if not all_chats:
+            print(f"  No chats matching workspace '{ws_filter}'.")
+            return
+
+    # Separate chats with content from empty stubs
+    with_content = [c for c in all_chats if c["messageCount"] > 0 or c["name"]]
+    stubs = [c for c in all_chats if c["messageCount"] == 0 and not c["name"]]
+
+    total_keys = sum(c["keyCount"] for c in all_chats)
+    content_keys = sum(c["keyCount"] for c in with_content)
+    stub_keys = sum(c["keyCount"] for c in stubs)
+
+    print(
+        f"  ─── Chat Summary ─────────────────────────────────────────\n\n"
+        f"  Total chats:        {len(all_chats)}\n"
+        f"  With content:       {len(with_content)} ({content_keys:,} DB keys)\n"
+        f"  Empty stubs:        {len(stubs)} ({stub_keys:,} DB keys)\n"
+        f"  Total DB keys:      {total_keys:,}\n"
+    )
+
+    # Group by workspace for display
+    by_ws: dict[str, list[dict]] = {}
+    for c in with_content:
+        by_ws.setdefault(c["workspace_label"], []).append(c)
+
+    print(f"  ─── Chats by workspace ───────────────────────────────────\n")
+    ws_list = sorted(by_ws.items(), key=lambda x: sum(c["keyCount"] for c in x[1]), reverse=True)
+
+    chat_index: dict[int, dict] = {}
+    idx = 1
+    for ws_label, chats in ws_list:
+        ws_keys = sum(c["keyCount"] for c in chats)
+        print(f"  {ws_label} ({len(chats)} chats, {ws_keys:,} keys)")
+        for c in sorted(chats, key=lambda x: x["keyCount"], reverse=True):
+            name = c["name"][:38] or "(unnamed)"
+            print(
+                f"    {idx:>3}. {name:<40} "
+                f"{c['messageCount']:>4} msgs  "
+                f"{c['keyCount']:>5} keys"
+            )
+            chat_index[idx] = c
+            idx += 1
+        print()
+
+    if stubs:
+        print(f"  + {len(stubs)} empty stubs (select 'stubs' to purge them)\n")
+
+    print(
+        f"  Select chats to delete:\n"
+        f"    Numbers:    1,3,5  or  1-10  or  1-3,7,9-12\n"
+        f"    Workspace:  all:<name>  (e.g. all:RankThis)\n"
+        f"    Stubs:      stubs  (delete all empty stubs)\n"
+        f"    Everything: all\n"
+        f"    Cancel:     q\n"
+    )
+
+    try:
+        choice = input("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        return
+
+    if not choice or choice.lower() == "q":
+        print("  Cancelled.")
+        return
+
+    selected_ids: list[str] = []
+
+    if choice.lower() == "all":
+        selected_ids = [c["composerId"] for c in all_chats]
+        print(f"\n  Selected ALL {len(selected_ids)} chats (including stubs).")
+    elif choice.lower() == "stubs":
+        selected_ids = [c["composerId"] for c in stubs]
+        print(f"\n  Selected {len(selected_ids)} empty stubs.")
+    elif choice.lower().startswith("all:"):
+        ws_name = choice[4:].strip().lower()
+        for c in all_chats:
+            if ws_name in c["workspace_label"].lower():
+                selected_ids.append(c["composerId"])
+        if not selected_ids:
+            print(f"  No chats matching workspace '{ws_name}'.")
+            return
+        print(f"\n  Selected {len(selected_ids)} chats from matching workspace(s).")
+    else:
+        # Parse number ranges
+        try:
+            for part in choice.split(","):
+                part = part.strip()
+                if "-" in part:
+                    start, end = part.split("-", 1)
+                    for n in range(int(start), int(end) + 1):
+                        if n in chat_index:
+                            selected_ids.append(chat_index[n]["composerId"])
+                else:
+                    n = int(part)
+                    if n in chat_index:
+                        selected_ids.append(chat_index[n]["composerId"])
+        except ValueError:
+            print("  Invalid selection.")
+            return
+
+    if not selected_ids:
+        print("  Nothing selected.")
+        return
+
+    selected_keys = sum(
+        c["keyCount"] for c in all_chats if c["composerId"] in set(selected_ids)
+    )
+    print(
+        f"\n  Will delete {len(selected_ids)} chat(s) "
+        f"({selected_keys:,} DB keys)."
+    )
+    try:
+        confirm = input("  Continue? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        return
+
+    if confirm not in ("y", "yes"):
+        print("  Cancelled.")
+        return
+
+    deleted, keys_removed = purge_chats(selected_ids, force=force)
+    print(f"\n  Deleted {deleted} chat(s), removed {keys_removed:,} DB keys.")
+    print("  Run VACUUM on the global DB to reclaim disk space:")
+    print(f"    sqlite3 '{paths.get_global_db_path()}' 'VACUUM;'")
+    print()
+
+
 def cmd_migrate(args):
     """Migrate old chats to the Cursor 3.0 global index."""
     from .importer import migrate_to_global_headers
@@ -1963,6 +2113,19 @@ def main():
     )
     p_migrate.set_defaults(func=cmd_migrate)
 
+    p_purge = subparsers.add_parser(
+        "purge", help="Delete chats from Cursor's database to reclaim space"
+    )
+    p_purge.add_argument(
+        "--workspace", "-w",
+        help="Filter to chats from a specific workspace (name substring)",
+    )
+    p_purge.add_argument(
+        "--force", action="store_true",
+        help="Skip the Cursor-running check",
+    )
+    p_purge.set_defaults(func=cmd_purge)
+
     args = parser.parse_args()
     if not args.command:
         print(
@@ -1993,6 +2156,8 @@ def main():
             "  doctor --recover      Re-register orphaned chats in workspaces\n"
             "  migrate               Migrate old chats to Cursor 3.0 index\n"
             "  migrate --dry-run     Preview migration without writing\n"
+            "  purge                 Delete chats from Cursor DB to free space\n"
+            "  purge -w <name>       Filter purge to a specific workspace\n"
             "  delete -s             Select which snapshots to delete\n"
             "  delete --all-projects Delete ALL snapshots\n"
             "\n"

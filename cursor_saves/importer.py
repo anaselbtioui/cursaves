@@ -1606,3 +1606,209 @@ def migrate_to_global_headers(
     print(f"Migrated {len(final_entries)} chat(s) to global index.")
     print("Restart Cursor to see them in the sidebar.")
     return len(final_entries), already_present
+
+
+# ── Purge ─────────────────────────────────────────────────────────────
+
+
+def list_all_chats_with_sizes() -> list[dict]:
+    """List every chat in Cursor's global DB with approximate size info.
+
+    Returns a list of dicts with:
+      composerId, name, messageCount, keyCount, workspace_label, workspace_dir
+    Sorted by keyCount descending (largest first).
+    """
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return []
+
+    # Build workspace mapping from global headers + old allComposers
+    headers_map = paths._build_global_headers_map()
+    ws_by_hash: dict[str, dict] = {}
+    for ws in paths.list_all_workspaces():
+        ws_by_hash[ws["workspace_dir"].name] = ws
+
+    # Map composerId -> workspace label using global headers
+    cid_to_ws: dict[str, str] = {}
+    cid_to_ws_dir: dict[str, str] = {}
+    for ws_hash, entries in headers_map.items():
+        ws = ws_by_hash.get(ws_hash)
+        if ws:
+            label = os.path.basename(ws["path"])
+            host = ws.get("host")
+            if host:
+                label += f" ({host})"
+        else:
+            label = ws_hash[:12]
+        for e in entries:
+            cid = e.get("composerId", "")
+            cid_to_ws[cid] = label
+            if ws:
+                cid_to_ws_dir[cid] = str(ws["workspace_dir"])
+
+    # Also build from old allComposers in workspace DBs
+    for ws in ws_by_hash.values():
+        ws_db = ws["workspace_dir"] / "state.vscdb"
+        if not ws_db.exists():
+            continue
+        try:
+            with db.CursorDB(ws_db) as cdb:
+                data = cdb.get_json("composer.composerData", table="ItemTable")
+                if data:
+                    for c in data.get("allComposers", []):
+                        cid = c.get("composerId", "")
+                        if cid and cid not in cid_to_ws:
+                            label = os.path.basename(ws["path"])
+                            host = ws.get("host")
+                            if host:
+                                label += f" ({host})"
+                            cid_to_ws[cid] = label
+                            cid_to_ws_dir[cid] = str(ws["workspace_dir"])
+        except Exception:
+            continue
+
+    # Scan global DB for all chats — use efficient grouped counting
+    results = []
+    with db.CursorDB(global_db_path) as gcdb:
+        # Two efficient grouped queries instead of N individual ones
+        print("  Counting bubble entries...")
+        bubble_counts = gcdb.count_keys_by_chat_prefix("bubbleId")
+        print("  Counting checkpoint entries...")
+        checkpoint_counts = gcdb.count_keys_by_chat_prefix("checkpointId")
+
+        print("  Reading chat metadata...")
+        all_cd_keys = gcdb.list_keys("composerData:")
+
+        for key in all_cd_keys:
+            cid = key.split(":", 1)[1]
+            cd = gcdb.get_json(key)
+            if not cd:
+                continue
+            msgs = len(cd.get("fullConversationHeadersOnly", []))
+            name = cd.get("name", "")
+            bubble_count = bubble_counts.get(cid, 0)
+            checkpoint_count = checkpoint_counts.get(cid, 0)
+            key_count = 1 + bubble_count + checkpoint_count
+
+            results.append({
+                "composerId": cid,
+                "name": name,
+                "messageCount": msgs,
+                "keyCount": key_count,
+                "bubbleCount": bubble_count,
+                "checkpointCount": checkpoint_count,
+                "workspace_label": cid_to_ws.get(cid, "unknown"),
+                "workspace_dir": cid_to_ws_dir.get(cid, ""),
+            })
+
+    results.sort(key=lambda x: x["keyCount"], reverse=True)
+    return results
+
+
+def purge_chats(
+    composer_ids: list[str],
+    force: bool = False,
+) -> tuple[int, int]:
+    """Delete chats and all their data from Cursor's databases.
+
+    Removes from the global DB: composerData, bubbleId, checkpointId,
+    and messageRequestContext entries. Also removes from
+    composer.composerHeaders (3.0+) and workspace allComposers (2.x).
+
+    Args:
+        composer_ids: List of composer IDs to delete.
+        force: Skip the Cursor-running check.
+
+    Returns (deleted_count, keys_removed).
+    """
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command, then reopen Cursor.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0, 0
+
+    if not composer_ids:
+        return 0, 0
+
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return 0, 0
+
+    backup_path = db.backup_db(global_db_path)
+    print(f"  Backed up global DB to {backup_path.name}")
+
+    cid_set = set(composer_ids)
+    total_keys = 0
+
+    # Delete from global DB (cursorDiskKV)
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        for cid in composer_ids:
+            keys_deleted = 0
+            keys_deleted += write_cdb.delete_keys([f"composerData:{cid}"])
+            keys_deleted += write_cdb.delete_keys_by_prefix(f"bubbleId:{cid}:")
+            keys_deleted += write_cdb.delete_keys_by_prefix(f"checkpointId:{cid}:")
+            keys_deleted += write_cdb.delete_keys_by_prefix(f"messageRequestContext:{cid}:")
+            total_keys += keys_deleted
+
+        # Remove from composer.composerHeaders (global DB, ItemTable)
+        headers = write_cdb.get_json("composer.composerHeaders", table="ItemTable")
+        if headers and "allComposers" in headers:
+            before = len(headers["allComposers"])
+            headers["allComposers"] = [
+                c for c in headers["allComposers"]
+                if c.get("composerId") not in cid_set
+            ]
+            if len(headers["allComposers"]) < before:
+                write_cdb.write_json(
+                    "composer.composerHeaders", headers, table="ItemTable"
+                )
+    finally:
+        write_cdb.close()
+
+    paths.invalidate_headers_cache()
+
+    # Remove from workspace DBs (allComposers + selectedComposerIds)
+    for ws in paths.list_all_workspaces():
+        ws_db_path = ws["workspace_dir"] / "state.vscdb"
+        if not ws_db_path.exists():
+            continue
+        try:
+            ws_cdb = db.CursorDB(ws_db_path)
+            try:
+                data = ws_cdb.get_json("composer.composerData", table="ItemTable")
+                if not data:
+                    continue
+                changed = False
+
+                if "allComposers" in data:
+                    before = len(data["allComposers"])
+                    data["allComposers"] = [
+                        c for c in data["allComposers"]
+                        if c.get("composerId") not in cid_set
+                    ]
+                    if len(data["allComposers"]) < before:
+                        changed = True
+
+                for list_key in ("selectedComposerIds", "lastFocusedComposerIds"):
+                    if list_key in data:
+                        before = len(data[list_key])
+                        data[list_key] = [
+                            c for c in data[list_key] if c not in cid_set
+                        ]
+                        if len(data[list_key]) < before:
+                            changed = True
+
+                if changed:
+                    ws_cdb.write_json(
+                        "composer.composerData", data, table="ItemTable"
+                    )
+            finally:
+                ws_cdb.close()
+        except Exception:
+            continue
+
+    return len(composer_ids), total_keys

@@ -119,6 +119,34 @@ class CursorDB:
         except sqlite3.OperationalError:
             return []
 
+    def count_keys_by_chat_prefix(
+        self, key_type: str, table: str = "cursorDiskKV"
+    ) -> dict[str, int]:
+        """Count keys grouped by chat ID for a given key type prefix.
+
+        For example, key_type="bubbleId" counts all keys like
+        "bubbleId:<uuid>:..." and returns {<uuid>: count, ...}.
+
+        Uses a single SQL query — efficient even on large databases.
+        """
+        conn = self._ensure_read_copy()
+        result: dict[str, int] = {}
+        try:
+            prefix = key_type + ":"
+            rows = conn.execute(
+                f"""SELECT SUBSTR(key, {len(prefix) + 1}, 36) AS cid, COUNT(*)
+                    FROM {table}
+                    WHERE key LIKE ?
+                    GROUP BY cid""",
+                (prefix + "%",),
+            ).fetchall()
+            for cid, count in rows:
+                if cid and len(cid) == 36:
+                    result[cid] = count
+        except sqlite3.OperationalError:
+            pass
+        return result
+
     def get_json(self, key: str, table: str = "cursorDiskKV") -> Optional[Any]:
         """Get and parse a JSON value."""
         raw = self.get_item(key, table=table)
@@ -183,6 +211,42 @@ class CursorDB:
             for key, data in items
         ]
         self.write_batch(serialized, table=table)
+
+    def delete_keys(self, keys: list[str], table: str = "cursorDiskKV") -> int:
+        """Delete multiple keys in a single transaction on the ORIGINAL database.
+
+        Returns the number of rows deleted.
+        """
+        if not keys:
+            return 0
+        conn = self._get_write_conn()
+        conn.execute("BEGIN")
+        try:
+            total = 0
+            for batch_start in range(0, len(keys), 500):
+                batch = keys[batch_start:batch_start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE key IN ({placeholders})", batch
+                )
+                total += cur.rowcount
+            conn.execute("COMMIT")
+            return total
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def delete_keys_by_prefix(self, prefix: str, table: str = "cursorDiskKV") -> int:
+        """Delete all keys matching a prefix on the ORIGINAL database.
+
+        Returns the number of rows deleted.
+        """
+        conn = self._get_write_conn()
+        cur = conn.execute(
+            f"DELETE FROM {table} WHERE key LIKE ?", (prefix + "%",)
+        )
+        conn.commit()
+        return cur.rowcount
 
 
 
