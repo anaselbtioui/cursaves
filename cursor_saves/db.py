@@ -16,13 +16,21 @@ class CursorDB:
     the original file and require Cursor to be closed.
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, live_reads: bool = False):
         self.db_path = db_path
+        self.live_reads = live_reads
         self._tmp_path: Optional[Path] = None
         self._conn: Optional[sqlite3.Connection] = None
 
     def _ensure_read_copy(self) -> sqlite3.Connection:
-        """Copy the database to a temp file and open a read-only connection."""
+        """Copy the database to a temp file and open a read-only connection.
+
+        When live_reads is True, read directly from the original database.
+        Only safe when Cursor is not running (import/repair paths).
+        """
+        if self.live_reads:
+            return self._get_write_conn()
+
         if self._conn is not None:
             return self._conn
 
@@ -49,17 +57,23 @@ class CursorDB:
             pass  # Not in WAL mode, that's fine
         return self._conn
 
-    def close(self):
-        """Close connections and clean up temp files."""
+    def invalidate_read_copy(self):
+        """Drop the cached temp read copy so the next read re-syncs from disk."""
+        if self.live_reads:
+            return
         if self._conn:
             self._conn.close()
             self._conn = None
-        if hasattr(self, "_write_conn") and self._write_conn:
-            self._write_conn.close()
-            self._write_conn = None
         if self._tmp_path:
             shutil.rmtree(self._tmp_path.parent, ignore_errors=True)
             self._tmp_path = None
+
+    def close(self):
+        """Close connections and clean up temp files."""
+        self.invalidate_read_copy()
+        if hasattr(self, "_write_conn") and self._write_conn:
+            self._write_conn.close()
+            self._write_conn = None
 
     def __enter__(self):
         return self

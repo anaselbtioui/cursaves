@@ -378,6 +378,7 @@ def _check_conflict(
     composer_id: str,
     incoming_bubble_ids: set[str],
     incoming_header_ids: Optional[set[str]] = None,
+    _cdb: "Optional[db.CursorDB]" = None,
 ) -> str:
     """Compare local chat state against incoming snapshot.
 
@@ -396,9 +397,13 @@ def _check_conflict(
     if not global_db_path.exists():
         return "new"
 
-    with db.CursorDB(global_db_path) as cdb:
-        local_keys = cdb.list_keys(f"bubbleId:{composer_id}:")
-        local_data = cdb.get_json(f"composerData:{composer_id}")
+    if _cdb is not None:
+        local_keys = _cdb.list_keys(f"bubbleId:{composer_id}:")
+        local_data = _cdb.get_json(f"composerData:{composer_id}")
+    else:
+        with db.CursorDB(global_db_path) as cdb:
+            local_keys = cdb.list_keys(f"bubbleId:{composer_id}:")
+            local_data = cdb.get_json(f"composerData:{composer_id}")
 
     if not local_keys:
         return "new"
@@ -441,6 +446,7 @@ def import_snapshot(
     target_project_path: str,
     target_workspace_dir: Optional[Path] = None,
     skip_backup: bool = False,
+    _global_cdb: "Optional[db.CursorDB]" = None,
 ) -> bool:
     """Import a conversation snapshot into Cursor's databases.
 
@@ -513,8 +519,13 @@ def import_snapshot(
     incoming_header_ids = {
         h.get("bubbleId") for h in headers if h.get("bubbleId")
     }
+    print("  Checking local state...", flush=True)
     conflict = _check_conflict(
-        global_db_path, composer_id, incoming_bubble_ids, incoming_header_ids,
+        global_db_path,
+        composer_id,
+        incoming_bubble_ids,
+        incoming_header_ids,
+        _cdb=_global_cdb,
     )
     chat_name = composer_data.get("name", "Untitled")
     source_label = snapshot.get("sourceHost") or snapshot.get("sourceMachine") or "remote"
@@ -623,7 +634,8 @@ def import_snapshot(
         print(f"  Backed up global DB to {backup_path.name}")
 
     # ── Step 2: Write conversation data to global DB ────────────────
-    global_cdb = db.CursorDB(global_db_path)
+    own_global_cdb = _global_cdb is None
+    global_cdb = _global_cdb or db.CursorDB(global_db_path, live_reads=True)
     try:
         # Write the main conversation data
         global_cdb.write_json(f"composerData:{composer_id}", composer_data)
@@ -653,6 +665,7 @@ def import_snapshot(
 
         # Write bubble entries in a single transaction (can be 50K+ entries)
         if bubble_entries:
+            print(f"  Writing {len(bubble_entries)} bubble(s)...", flush=True)
             if source_path and source_path != target_path:
                 bubble_entries = {
                     bid: rewrite_paths(bdata, source_path, target_path)
@@ -687,13 +700,15 @@ def import_snapshot(
 
         # Write agent state blobs (encrypted context for conversation continuation)
         if agent_blobs:
+            print(f"  Writing {len(agent_blobs)} agent blob(s)...", flush=True)
             import base64
             global_cdb.write_batch([
                 (f"agentKv:blob:{bid}", base64.b64decode(bdata))
                 for bid, bdata in agent_blobs.items()
             ])
     finally:
-        global_cdb.close()
+        if own_global_cdb:
+            global_cdb.close()
 
     # ── Step 3: Register conversation in workspace DB ───────────────
     ws_db_path = ws_dir / "state.vscdb"
@@ -705,7 +720,8 @@ def import_snapshot(
     _register_in_workspace(composer_id, composer_data, ws_dir)
 
     # ── Step 4: Verify writes ─────────────────────────────────────────
-    verify_cdb = db.CursorDB(global_db_path)
+    own_verify_cdb = _global_cdb is None
+    verify_cdb = _global_cdb or db.CursorDB(global_db_path, live_reads=True)
     try:
         written = verify_cdb.get_json(f"composerData:{composer_id}")
         if not written:
@@ -729,7 +745,8 @@ def import_snapshot(
         else:
             print(f"  Done: \"{final_name}\" ({final_msgs} msgs)")
     finally:
-        verify_cdb.close()
+        if own_verify_cdb:
+            verify_cdb.close()
 
     return True
 
@@ -984,14 +1001,27 @@ def import_from_snapshot_dir(
     success = 0
     failure = 0
 
-    for sf in snapshot_files:
-        print(f"Importing {sf.name}...")
-        if import_snapshot(sf, target_project_path, ws_dir, skip_backup=True):
-            success += 1
-            print(f"  OK")
-        else:
-            failure += 1
-            print(f"  FAILED")
+    global_cdb = (
+        db.CursorDB(global_db_path, live_reads=True) if global_db_path.exists() else None
+    )
+    try:
+        for sf in snapshot_files:
+            print(f"Importing {sf.name}...", flush=True)
+            if import_snapshot(
+                sf,
+                target_project_path,
+                ws_dir,
+                skip_backup=True,
+                _global_cdb=global_cdb,
+            ):
+                success += 1
+                print("  OK", flush=True)
+            else:
+                failure += 1
+                print("  FAILED", flush=True)
+    finally:
+        if global_cdb:
+            global_cdb.close()
 
     return success, failure
 
