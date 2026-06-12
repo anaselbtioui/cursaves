@@ -167,21 +167,32 @@ def rewrite_image_paths(
         return data
 
     if isinstance(data, str):
+        if "images" not in data.casefold():
+            return data
         result = data
-        for filename in sorted(filenames, key=len, reverse=True):
-            new_path = image_path_for_workspace(workspace_dir, filename)
-            pattern = re.compile(
-                r'[^"\s]*[/\\]images[/\\]' + re.escape(filename),
-                re.IGNORECASE,
-            )
-            result = pattern.sub(new_path, result)
+        replaced: set[str] = set()
+        for match in _WORKSPACE_IMAGE_FILE_RE.finditer(data):
+            old_path = match.group(0)
+            if old_path in replaced:
+                continue
+            fname = match.group(1)
+            if fname in filenames:
+                result = result.replace(
+                    old_path, image_path_for_workspace(workspace_dir, fname)
+                )
+                replaced.add(old_path)
         return result
 
     if isinstance(data, dict):
-        return {
-            key: rewrite_image_paths(value, workspace_dir, filenames)
-            for key, value in data.items()
-        }
+        out: dict[str, Any] = {}
+        for key, value in data.items():
+            if key == "path" and isinstance(value, str):
+                fname = Path(value).name
+                if fname in filenames:
+                    out[key] = image_path_for_workspace(workspace_dir, fname)
+                    continue
+            out[key] = rewrite_image_paths(value, workspace_dir, filenames)
+        return out
 
     if isinstance(data, list):
         return [rewrite_image_paths(item, workspace_dir, filenames) for item in data]

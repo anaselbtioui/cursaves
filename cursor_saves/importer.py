@@ -141,8 +141,11 @@ def is_cursor_running() -> bool:
                     and "Frameworks" not in line
                 ):
                     return True
-            elif system == "Linux" and re.search(r"\bCursor\b", line) and "Helper" not in line:
-                return True
+            elif system == "Linux":
+                if re.search(r"\bCursor\b", line) and "Helper" not in line:
+                    return True
+                if "cursor-server" in line or ".cursor-server" in line:
+                    return True
         return False
     except FileNotFoundError:
         return False
@@ -663,9 +666,9 @@ def import_snapshot(
                 for msg_key, context in message_contexts.items()
             ])
 
-        # Write bubble entries in a single transaction (can be 50K+ entries)
+        # Write bubble entries (can be 50K+ entries on large chats)
         if bubble_entries:
-            print(f"  Writing {len(bubble_entries)} bubble(s)...", flush=True)
+            n_bubbles = len(bubble_entries)
             if source_path and source_path != target_path:
                 bubble_entries = {
                     bid: rewrite_paths(bdata, source_path, target_path)
@@ -676,10 +679,14 @@ def import_snapshot(
                     bid: images.rewrite_image_paths(bdata, ws_dir, installed_images)
                     for bid, bdata in bubble_entries.items()
                 }
-            global_cdb.write_json_batch([
-                (f"bubbleId:{composer_id}:{bubble_id}", bubble_data)
-                for bubble_id, bubble_data in bubble_entries.items()
-            ])
+            print(f"  Writing {n_bubbles} bubble(s)...", flush=True)
+            global_cdb.write_json_batch(
+                [
+                    (f"bubbleId:{composer_id}:{bubble_id}", bubble_data)
+                    for bubble_id, bubble_data in bubble_entries.items()
+                ],
+                progress_label="bubbles",
+            )
 
         # Write checkpoint data (workspace state snapshots for agent continuation)
         if checkpoints:
@@ -700,12 +707,19 @@ def import_snapshot(
 
         # Write agent state blobs (encrypted context for conversation continuation)
         if agent_blobs:
-            print(f"  Writing {len(agent_blobs)} agent blob(s)...", flush=True)
+            n_blobs = len(agent_blobs)
+            print(f"  Writing {n_blobs} agent blob(s)...", flush=True)
             import base64
-            global_cdb.write_batch([
-                (f"agentKv:blob:{bid}", base64.b64decode(bdata))
-                for bid, bdata in agent_blobs.items()
-            ])
+            global_cdb.write_batch(
+                [
+                    (f"agentKv:blob:{bid}", base64.b64decode(bdata))
+                    for bid, bdata in agent_blobs.items()
+                ],
+                progress_label="agent blobs",
+            )
+    except RuntimeError as e:
+        print(f"  ERROR: {e}", file=sys.stderr)
+        return False
     finally:
         if own_global_cdb:
             global_cdb.close()
@@ -1004,6 +1018,14 @@ def import_from_snapshot_dir(
     global_cdb = (
         db.CursorDB(global_db_path, live_reads=True) if global_db_path.exists() else None
     )
+    if global_cdb is not None:
+        try:
+            global_cdb.assert_writable()
+        except RuntimeError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            global_cdb.close()
+            return 0, len(snapshot_files)
+
     try:
         for sf in snapshot_files:
             print(f"Importing {sf.name}...", flush=True)
@@ -1021,6 +1043,7 @@ def import_from_snapshot_dir(
                 print("  FAILED", flush=True)
     finally:
         if global_cdb:
+            global_cdb.checkpoint_wal()
             global_cdb.close()
 
     return success, failure

@@ -176,8 +176,42 @@ class CursorDB:
     def _get_write_conn(self) -> sqlite3.Connection:
         """Get or create a connection for write operations on the ORIGINAL database."""
         if not hasattr(self, "_write_conn") or self._write_conn is None:
-            self._write_conn = sqlite3.connect(str(self.db_path))
+            self._write_conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+            self._apply_bulk_write_pragmas(self._write_conn)
         return self._write_conn
+
+    def _apply_bulk_write_pragmas(self, conn: sqlite3.Connection) -> None:
+        """Tune SQLite for bulk import (Cursor must be closed)."""
+        for pragma in (
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA temp_store=MEMORY",
+            "PRAGMA cache_size=-64000",
+        ):
+            try:
+                conn.execute(pragma)
+            except sqlite3.OperationalError:
+                pass
+
+    def assert_writable(self) -> None:
+        """Fail fast if another process (Cursor, cursor-server) holds the DB lock."""
+        conn = self._get_write_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError as e:
+            raise RuntimeError(
+                "Global database is locked. Quit Cursor completely and retry.\n"
+                "If you use Remote SSH, disconnect the remote window first —\n"
+                "cursor-server keeps the DB open while connected."
+            ) from e
+
+    def checkpoint_wal(self) -> None:
+        """Merge WAL into the main DB file after a large import batch."""
+        conn = self._get_write_conn()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:
+            pass
 
     def write_item(self, key: str, value: str, table: str = "ItemTable"):
         """Write a value to the key-value store on the ORIGINAL database.
@@ -200,31 +234,85 @@ class CursorDB:
         """Write a JSON value to the ORIGINAL database."""
         self.write_item(key, json.dumps(data, separators=(",", ":")), table=table)
 
-    def write_batch(self, items: list[tuple[str, str]], table: str = "cursorDiskKV"):
-        """Write multiple key-value pairs in a single transaction.
+    def write_batch(
+        self,
+        items: list[tuple[str, str]],
+        table: str = "cursorDiskKV",
+        *,
+        chunk_size: int = 100,
+        progress_label: str | None = None,
+    ):
+        """Write multiple key-value pairs in chunked transactions.
 
-        Much faster than calling write_item() in a loop -- uses one
-        connection and one transaction for all items.
+        Much faster than calling write_item() in a loop. Uses BEGIN IMMEDIATE
+        so a lock from Cursor/cursor-server fails in seconds instead of hanging.
         """
+        if not items:
+            return
         conn = self._get_write_conn()
-        conn.execute("BEGIN")
-        try:
-            conn.executemany(
-                f"INSERT OR REPLACE INTO {table} (key, value) VALUES (?, ?)",
-                items,
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        total = len(items)
+        for start in range(0, total, chunk_size):
+            chunk = items[start : start + chunk_size]
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as e:
+                raise RuntimeError(
+                    "Global database is locked. Quit Cursor completely and retry.\n"
+                    "If you use Remote SSH, disconnect the remote window first —\n"
+                    "cursor-server keeps the DB open while connected."
+                ) from e
+            try:
+                conn.executemany(
+                    f"INSERT OR REPLACE INTO {table} (key, value) VALUES (?, ?)",
+                    chunk,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            if progress_label and total > chunk_size:
+                done = min(start + len(chunk), total)
+                print(f"    {progress_label} {done}/{total}...", flush=True)
 
-    def write_json_batch(self, items: list[tuple[str, Any]], table: str = "cursorDiskKV"):
-        """Write multiple JSON key-value pairs in a single transaction."""
-        serialized = [
-            (key, json.dumps(data, separators=(",", ":")))
-            for key, data in items
-        ]
-        self.write_batch(serialized, table=table)
+    def write_json_batch(
+        self,
+        items: list[tuple[str, Any]],
+        table: str = "cursorDiskKV",
+        *,
+        chunk_size: int = 100,
+        progress_label: str | None = None,
+    ):
+        """Write multiple JSON key-value pairs in chunked transactions."""
+        if not items:
+            return
+        total = len(items)
+        conn = self._get_write_conn()
+        for start in range(0, total, chunk_size):
+            chunk = items[start : start + chunk_size]
+            serialized = [
+                (key, json.dumps(data, separators=(",", ":")))
+                for key, data in chunk
+            ]
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as e:
+                raise RuntimeError(
+                    "Global database is locked. Quit Cursor completely and retry.\n"
+                    "If you use Remote SSH, disconnect the remote window first —\n"
+                    "cursor-server keeps the DB open while connected."
+                ) from e
+            try:
+                conn.executemany(
+                    f"INSERT OR REPLACE INTO {table} (key, value) VALUES (?, ?)",
+                    serialized,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            if progress_label and total > chunk_size:
+                done = min(start + len(chunk), total)
+                print(f"    {progress_label} {done}/{total}...", flush=True)
 
     def delete_keys(self, keys: list[str], table: str = "cursorDiskKV") -> int:
         """Delete multiple keys in a single transaction on the ORIGINAL database.
