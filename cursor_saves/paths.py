@@ -75,6 +75,15 @@ def get_cursor_projects_dir() -> Path:
     return Path.home() / ".cursor" / "projects"
 
 
+def _paths_equal(a: str, b: str) -> bool:
+    """Compare two filesystem paths, case-insensitive on Windows."""
+    left = os.path.normpath(os.path.expanduser(a))
+    right = os.path.normpath(os.path.expanduser(b))
+    if platform.system() == "Windows":
+        return os.path.normcase(left) == os.path.normcase(right)
+    return left == right
+
+
 def uri_to_path(uri: str) -> str:
     """Convert a file:// URI to a local filesystem path."""
     if not uri.startswith("file://"):
@@ -86,7 +95,11 @@ def uri_to_path(uri: str) -> str:
         path = path[1:]
     if platform.system() == "Windows":
         path = path.replace("/", os.sep)
-    return os.path.normpath(path)
+    path = os.path.normpath(path)
+    # Cursor URIs use lowercase drive letters; normalize to match cwd casing.
+    if platform.system() == "Windows" and len(path) >= 2 and path[1] == ":":
+        path = path[0].upper() + path[1:]
+    return path
 
 
 def path_to_uri(path: str) -> str:
@@ -164,9 +177,6 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     if not ws_storage.exists():
         return []
 
-    # Normalise the target path for comparison
-    target = os.path.normpath(os.path.expanduser(project_path))
-
     matches = []
     for ws_dir in ws_storage.iterdir():
         if not ws_dir.is_dir():
@@ -190,7 +200,7 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             else:
                 continue
 
-            if os.path.normpath(folder_path) == target:
+            if _paths_equal(folder_path, project_path):
                 matches.append(ws_dir)
         except (json.JSONDecodeError, OSError):
             continue
@@ -532,8 +542,7 @@ def find_all_matching_workspaces(source_path: str) -> list[dict]:
     sorted by match quality (exact matches first) then by mtime.
     """
     all_ws = list_all_workspaces()
-    source_normalized = os.path.normpath(source_path)
-    source_basename = os.path.basename(source_normalized)
+    source_basename = os.path.basename(os.path.normpath(source_path))
 
     exact_matches = []
     basename_matches = []
@@ -542,7 +551,7 @@ def find_all_matching_workspaces(source_path: str) -> list[dict]:
         ws_path = ws["path"]
         ws_basename = os.path.basename(ws_path)
 
-        if ws_path == source_normalized:
+        if _paths_equal(ws_path, source_path):
             exact_matches.append(ws)
         elif ws_basename == source_basename:
             basename_matches.append(ws)
