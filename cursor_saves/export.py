@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from . import db, paths
+from . import db, images, paths
 
 
 def get_workspace_conversations(
@@ -485,6 +485,9 @@ def export_conversation(
             "transcript": get_transcript(project_path, composer_id),
             "messageContexts": contexts,
         }
+        image_assets = images.collect_image_assets(snapshot)
+        if image_assets:
+            snapshot["imageAssets"] = image_assets
 
         return snapshot
     finally:
@@ -519,7 +522,8 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
     project_dir.mkdir(parents=True, exist_ok=True)
 
     composer_id = snapshot["composerId"]
-    
+    image_assets = snapshot.pop("imageAssets", None) or {}
+
     # Remove old uncompressed file if it exists
     old_file = project_dir / f"{composer_id}.json"
     if old_file.exists():
@@ -551,7 +555,8 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
             snapshot["messageContexts"] = {}
             compressed = _compress_snapshot(snapshot)
     
-    # Clean up any previous shards or single file
+    # Clean up any previous shards, image assets, or single file
+    images.remove_image_assets(project_dir / f"{composer_id}.json.gz", composer_id)
     for old in project_dir.glob(f"{composer_id}.json.gz*"):
         if not old.name.endswith(".meta.json"):
             old.unlink()
@@ -573,6 +578,8 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
     num_shards = 0
     if len(compressed) > SHARD_SIZE_BYTES:
         num_shards = (len(compressed) + SHARD_SIZE_BYTES - 1) // SHARD_SIZE_BYTES
+    image_count = images.save_image_assets(image_assets, snapshot_file, composer_id)
+
     meta = {
         "composerId": composer_id,
         "name": cd.get("name"),
@@ -584,6 +591,7 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         "projectIdentifier": snapshot.get("projectIdentifier"),
         "version": snapshot.get("version"),
         "shardCount": num_shards if num_shards else None,
+        "imageCount": image_count or None,
     }
     meta_file = project_dir / f"{composer_id}.meta.json"
     meta_file.write_text(json.dumps(meta, indent=2))

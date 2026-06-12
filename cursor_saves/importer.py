@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from . import db, paths
+from . import db, images, paths
 
 
 def _get_shard_paths(base_path: Path) -> list[Path]:
@@ -317,6 +317,22 @@ def import_snapshot(
 
     composer_data = snapshot["composerData"]
 
+    if target_workspace_dir is not None:
+        ws_dir = target_workspace_dir
+    else:
+        ws_dir = find_or_create_workspace(target_path)
+
+    installed_images = images.install_image_assets(snapshot_path, composer_id, ws_dir)
+    inline_assets = snapshot.get("imageAssets") or {}
+    if inline_assets:
+        target_image_dir = ws_dir / "images"
+        target_image_dir.mkdir(parents=True, exist_ok=True)
+        import base64 as _b64
+
+        for filename, encoded in inline_assets.items():
+            (target_image_dir / filename).write_bytes(_b64.b64decode(encoded))
+            installed_images.add(filename)
+
     # Skip empty conversations (new-but-never-used chats)
     headers = composer_data.get("fullConversationHeadersOnly", [])
     if not headers and not composer_data.get("name"):
@@ -327,6 +343,10 @@ def import_snapshot(
     if source_path and source_path != target_path:
         print(f"  Rewriting paths: {source_path} -> {target_path}")
         composer_data = rewrite_paths(composer_data, source_path, target_path)
+
+    if installed_images:
+        composer_data = images.rewrite_image_paths(composer_data, ws_dir, installed_images)
+        print(f"  Restored {len(installed_images)} image(s) to workspace storage")
 
     content_blobs = snapshot.get("contentBlobs", {})
     message_contexts = snapshot.get("messageContexts", {})
@@ -409,6 +429,16 @@ def import_snapshot(
 
         # Write message contexts (batch)
         if message_contexts:
+            if source_path and source_path != target_path:
+                message_contexts = {
+                    msg_key: rewrite_paths(context, source_path, target_path)
+                    for msg_key, context in message_contexts.items()
+                }
+            if installed_images:
+                message_contexts = {
+                    msg_key: images.rewrite_image_paths(context, ws_dir, installed_images)
+                    for msg_key, context in message_contexts.items()
+                }
             global_cdb.write_json_batch([
                 (f"messageRequestContext:{composer_id}:{msg_key}", context)
                 for msg_key, context in message_contexts.items()
@@ -421,6 +451,11 @@ def import_snapshot(
                     bid: rewrite_paths(bdata, source_path, target_path)
                     for bid, bdata in bubble_entries.items()
                 }
+            if installed_images:
+                bubble_entries = {
+                    bid: images.rewrite_image_paths(bdata, ws_dir, installed_images)
+                    for bid, bdata in bubble_entries.items()
+                }
             global_cdb.write_json_batch([
                 (f"bubbleId:{composer_id}:{bubble_id}", bubble_data)
                 for bubble_id, bubble_data in bubble_entries.items()
@@ -431,6 +466,11 @@ def import_snapshot(
             if source_path and source_path != target_path:
                 checkpoints = {
                     cp_id: rewrite_paths(cp_data, source_path, target_path)
+                    for cp_id, cp_data in checkpoints.items()
+                }
+            if installed_images:
+                checkpoints = {
+                    cp_id: images.rewrite_image_paths(cp_data, ws_dir, installed_images)
                     for cp_id, cp_data in checkpoints.items()
                 }
             global_cdb.write_json_batch([
@@ -449,10 +489,6 @@ def import_snapshot(
         global_cdb.close()
 
     # ── Step 3: Register conversation in workspace DB ───────────────
-    if target_workspace_dir is not None:
-        ws_dir = target_workspace_dir
-    else:
-        ws_dir = find_or_create_workspace(target_path)
     ws_db_path = ws_dir / "state.vscdb"
 
     if not skip_backup and ws_db_path.exists():
