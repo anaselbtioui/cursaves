@@ -220,6 +220,159 @@ def _init_workspace_db(db_path: Path):
     conn.close()
 
 
+def _needs_cross_platform_path_refresh(data: Any, target_path: str) -> bool:
+    """Return True if chat data still references another machine's paths."""
+    source_path = os.path.normpath(os.path.expanduser(target_path))
+    for raw_path in images.extract_image_paths(data):
+        normalized = os.path.normpath(raw_path)
+        if platform.system() == "Windows":
+            if normalized.startswith("/"):
+                return True
+        elif re.match(r"^[A-Za-z]:[\\/]", normalized):
+            return True
+
+    if isinstance(data, str):
+        if platform.system() == "Windows" and "/home/" in data:
+            return True
+        if platform.system() != "Windows" and re.search(r"[A-Za-z]:\\", data):
+            return True
+        return False
+    if isinstance(data, dict):
+        return any(_needs_cross_platform_path_refresh(v, target_path) for v in data.values())
+    if isinstance(data, list):
+        return any(_needs_cross_platform_path_refresh(item, target_path) for item in data)
+    return False
+
+
+def _refresh_snapshot_assets(
+    snapshot_path: Path,
+    snapshot: dict,
+    composer_id: str,
+    composer_data: dict,
+    ws_dir: Path,
+    source_path: str,
+    target_path: str,
+    bubble_entries: dict,
+    checkpoints: dict,
+    message_contexts: dict,
+    content_blobs: dict,
+    agent_blobs: dict,
+) -> tuple[int, int, bool]:
+    """Backfill missing blobs/images and rewrite stale paths for an existing chat.
+
+    Returns (blobs_restored, images_restored, paths_refreshed).
+    """
+    import base64
+
+    from .export import _extract_agent_blob_ids
+
+    global_db_path = paths.get_global_db_path()
+    blobs_restored = 0
+    paths_refreshed = False
+
+    installed_images = images.install_image_assets(snapshot_path, composer_id, ws_dir)
+    inline_assets = snapshot.get("imageAssets") or {}
+    if inline_assets:
+        target_image_dir = ws_dir / "images"
+        target_image_dir.mkdir(parents=True, exist_ok=True)
+        for filename, encoded in inline_assets.items():
+            (target_image_dir / filename).write_bytes(base64.b64decode(encoded))
+            installed_images.add(filename)
+
+    global_cdb = db.CursorDB(global_db_path)
+    try:
+        local_data = global_cdb.get_json(f"composerData:{composer_id}") or composer_data
+        refs = _extract_agent_blob_ids(local_data)
+        to_write: list[tuple[str, bytes]] = []
+        for bid in refs:
+            if bid not in agent_blobs:
+                continue
+            key = f"agentKv:blob:{bid}"
+            if global_cdb.get_item_binary(key, table="cursorDiskKV") is None:
+                to_write.append((key, base64.b64decode(agent_blobs[bid])))
+        if to_write:
+            global_cdb.write_batch(to_write)
+            blobs_restored = len(to_write)
+
+        needs_paths = (
+            bool(installed_images)
+            or (source_path and source_path != target_path)
+            or _needs_cross_platform_path_refresh(local_data, target_path)
+        )
+        if not needs_paths:
+            return blobs_restored, len(installed_images), False
+
+        refreshed = composer_data
+        if source_path and source_path != target_path:
+            refreshed = rewrite_paths(refreshed, source_path, target_path)
+        if installed_images:
+            refreshed = images.rewrite_image_paths(refreshed, ws_dir, installed_images)
+
+        global_cdb.write_json(f"composerData:{composer_id}", refreshed)
+
+        if content_blobs:
+            global_cdb.write_batch(
+                [(f"composer.content.{h}", v) for h, v in content_blobs.items()]
+            )
+
+        if message_contexts:
+            refreshed_contexts = message_contexts
+            if source_path and source_path != target_path:
+                refreshed_contexts = {
+                    key: rewrite_paths(value, source_path, target_path)
+                    for key, value in refreshed_contexts.items()
+                }
+            if installed_images:
+                refreshed_contexts = {
+                    key: images.rewrite_image_paths(value, ws_dir, installed_images)
+                    for key, value in refreshed_contexts.items()
+                }
+            global_cdb.write_json_batch([
+                (f"messageRequestContext:{composer_id}:{msg_key}", context)
+                for msg_key, context in refreshed_contexts.items()
+            ])
+
+        if bubble_entries:
+            refreshed_bubbles = bubble_entries
+            if source_path and source_path != target_path:
+                refreshed_bubbles = {
+                    bid: rewrite_paths(bdata, source_path, target_path)
+                    for bid, bdata in refreshed_bubbles.items()
+                }
+            if installed_images:
+                refreshed_bubbles = {
+                    bid: images.rewrite_image_paths(bdata, ws_dir, installed_images)
+                    for bid, bdata in refreshed_bubbles.items()
+                }
+            global_cdb.write_json_batch([
+                (f"bubbleId:{composer_id}:{bubble_id}", bubble_data)
+                for bubble_id, bubble_data in refreshed_bubbles.items()
+            ])
+
+        if checkpoints:
+            refreshed_checkpoints = checkpoints
+            if source_path and source_path != target_path:
+                refreshed_checkpoints = {
+                    cp_id: rewrite_paths(cp_data, source_path, target_path)
+                    for cp_id, cp_data in refreshed_checkpoints.items()
+                }
+            if installed_images:
+                refreshed_checkpoints = {
+                    cp_id: images.rewrite_image_paths(cp_data, ws_dir, installed_images)
+                    for cp_id, cp_data in refreshed_checkpoints.items()
+                }
+            global_cdb.write_json_batch([
+                (f"checkpointId:{composer_id}:{cp_id}", cp_data)
+                for cp_id, cp_data in refreshed_checkpoints.items()
+            ])
+
+        paths_refreshed = True
+    finally:
+        global_cdb.close()
+
+    return blobs_restored, len(installed_images), paths_refreshed
+
+
 def _check_conflict(
     global_db_path: Path,
     composer_id: str,
@@ -367,18 +520,72 @@ def import_snapshot(
     source_label = snapshot.get("sourceHost") or snapshot.get("sourceMachine") or "remote"
 
     if conflict == "local_ahead":
+        blobs_restored, images_restored, paths_refreshed = _refresh_snapshot_assets(
+            snapshot_path,
+            snapshot,
+            composer_id,
+            composer_data,
+            ws_dir,
+            source_path,
+            target_path,
+            bubble_entries,
+            checkpoints,
+            message_contexts,
+            content_blobs,
+            agent_blobs,
+        )
         with db.CursorDB(global_db_path) as cdb:
             ld = cdb.get_json(f"composerData:{composer_id}")
         local_count = len((ld or {}).get("fullConversationHeadersOnly", []))
         snap_count = len(headers)
-        print(
-            f"  Skipped: \"{chat_name}\" — local has {local_count} msgs, "
-            f"snapshot has {snap_count} (local is newer, nothing to import)"
-        )
+        if blobs_restored or images_restored or paths_refreshed:
+            parts = []
+            if blobs_restored:
+                parts.append(f"{blobs_restored} blob(s)")
+            if images_restored:
+                parts.append(f"{images_restored} image(s)")
+            if paths_refreshed:
+                parts.append("paths refreshed")
+            print(
+                f"  Refreshed: \"{chat_name}\" — local has {local_count} msgs, "
+                f"snapshot has {snap_count}; " + ", ".join(parts)
+            )
+        else:
+            print(
+                f"  Skipped: \"{chat_name}\" — local has {local_count} msgs, "
+                f"snapshot has {snap_count} (local is newer, nothing to import)"
+            )
         return True
 
     if conflict == "identical":
-        print(f"  Skipped: \"{chat_name}\" — already up to date ({len(headers)} msgs)")
+        blobs_restored, images_restored, paths_refreshed = _refresh_snapshot_assets(
+            snapshot_path,
+            snapshot,
+            composer_id,
+            composer_data,
+            ws_dir,
+            source_path,
+            target_path,
+            bubble_entries,
+            checkpoints,
+            message_contexts,
+            content_blobs,
+            agent_blobs,
+        )
+        if blobs_restored or images_restored or paths_refreshed:
+            parts = []
+            if blobs_restored:
+                parts.append(f"{blobs_restored} blob(s)")
+            if images_restored:
+                parts.append(f"{images_restored} image(s)")
+            if paths_refreshed:
+                parts.append("paths refreshed")
+            print(
+                f"  Refreshed: \"{chat_name}\" ({len(headers)} msgs) — "
+                + ", ".join(parts)
+            )
+        else:
+            print(f"  Skipped: \"{chat_name}\" — already up to date ({len(headers)} msgs)")
         return True
 
     if conflict == "new":
