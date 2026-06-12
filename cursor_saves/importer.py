@@ -3,6 +3,8 @@
 import gzip
 import json
 import os
+import platform
+import re
 import subprocess
 import sys
 import uuid
@@ -109,6 +111,20 @@ def is_cursor_running() -> bool:
     Cursor executable while excluding helpers, crash handlers, and the
     macOS CursorUIViewService system process.
     """
+    system = platform.system()
+
+    if system == "Windows":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq Cursor.exe", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return result.returncode == 0 and "Cursor.exe" in result.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
     try:
         result = subprocess.run(
             ["ps", "-axo", "args"],
@@ -118,9 +134,14 @@ def is_cursor_running() -> bool:
         if result.returncode != 0:
             return False
         for line in result.stdout.splitlines():
-            if "Cursor.app/Contents/MacOS/Cursor" in line \
-                    and "Helper" not in line \
-                    and "Frameworks" not in line:
+            if system == "Darwin":
+                if (
+                    "Cursor.app/Contents/MacOS/Cursor" in line
+                    and "Helper" not in line
+                    and "Frameworks" not in line
+                ):
+                    return True
+            elif system == "Linux" and re.search(r"\bCursor\b", line) and "Helper" not in line:
                 return True
         return False
     except FileNotFoundError:
@@ -130,27 +151,35 @@ def is_cursor_running() -> bool:
 _SKIP_REWRITE_KEYS = frozenset({"conversationState"})
 
 
-def rewrite_paths(data: Any, old_prefix: str, new_prefix: str) -> Any:
-    """Recursively rewrite absolute paths in conversation data.
-
-    Replaces old_prefix with new_prefix in all string values that
-    look like file paths.  Skips binary/encoded fields like
-    ``conversationState`` (base64-encoded protobuf) that should
-    never be modified.
-    """
+def _rewrite_paths_once(data: Any, old_prefix: str, new_prefix: str) -> Any:
+    """Apply a single old->new prefix replacement throughout nested data."""
     if isinstance(data, str):
         if old_prefix in data:
             return data.replace(old_prefix, new_prefix)
         return data
-    elif isinstance(data, dict):
+    if isinstance(data, dict):
         return {
-            k: (v if k in _SKIP_REWRITE_KEYS else rewrite_paths(v, old_prefix, new_prefix))
+            k: (v if k in _SKIP_REWRITE_KEYS else _rewrite_paths_once(v, old_prefix, new_prefix))
             for k, v in data.items()
         }
-    elif isinstance(data, list):
-        return [rewrite_paths(item, old_prefix, new_prefix) for item in data]
-    else:
-        return data
+    if isinstance(data, list):
+        return [_rewrite_paths_once(item, old_prefix, new_prefix) for item in data]
+    return data
+
+
+def rewrite_paths(data: Any, old_prefix: str, new_prefix: str) -> Any:
+    """Recursively rewrite absolute paths in conversation data.
+
+    Replaces old_prefix with new_prefix in all string values that
+    look like file paths, including URI-encoded variants for cross-OS
+    imports.  Skips binary/encoded fields like ``conversationState``
+    (base64-encoded protobuf) that should never be modified.
+    """
+    pairs = paths.path_rewrite_pairs(old_prefix, new_prefix)
+    pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+    for old, new in pairs:
+        data = _rewrite_paths_once(data, old, new)
+    return data
 
 
 def find_or_create_workspace(project_path: str) -> Path:
@@ -170,7 +199,7 @@ def find_or_create_workspace(project_path: str) -> Path:
     ws_dir.mkdir(parents=True, exist_ok=True)
 
     # Create workspace.json
-    folder_uri = "file://" + os.path.normpath(project_path)
+    folder_uri = paths.path_to_uri(project_path)
     ws_json = ws_dir / "workspace.json"
     ws_json.write_text(json.dumps({"folder": folder_uri}))
 
@@ -828,9 +857,9 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
 
     uri_obj: dict = {"$mid": 1}
     if folder_uri.startswith("file://"):
-        fs_path = folder_uri[len("file://"):].replace("%20", " ")
+        fs_path = paths.uri_to_path(folder_uri)
         uri_obj["fsPath"] = fs_path
-        uri_obj["path"] = fs_path
+        uri_obj["path"] = fs_path.replace("\\", "/") if platform.system() == "Windows" else fs_path
         uri_obj["external"] = folder_uri
         uri_obj["scheme"] = "file"
     elif folder_uri.startswith("vscode-remote://"):

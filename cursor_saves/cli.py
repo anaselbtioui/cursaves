@@ -195,15 +195,20 @@ def cmd_workspaces(args):
 def _is_remote_path(path: str, source_machine: str) -> bool:
     """Check if a path looks like it came from an SSH remote session."""
     import platform
-    
+    import re
+
     # If path doesn't exist locally, it's likely remote
     if not os.path.exists(path):
         return True
-    
+
+    system = platform.system()
     # On Mac, local paths start with /Users
-    if platform.system() == "Darwin" and not path.startswith("/Users"):
+    if system == "Darwin" and not path.startswith("/Users"):
         return True
-    
+    # On Windows, local paths look like C:\...
+    if system == "Windows" and not re.match(r"^[A-Za-z]:\\", path):
+        return True
+
     return False
 
 
