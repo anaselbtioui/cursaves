@@ -485,7 +485,11 @@ def export_conversation(
             "transcript": get_transcript(project_path, composer_id),
             "messageContexts": contexts,
         }
-        image_assets = images.collect_image_assets(snapshot)
+        workspace_dirs = paths.find_workspace_dirs_for_project(project_path)
+        image_assets = images.collect_image_assets(
+            snapshot,
+            workspace_dir=workspace_dirs[0] if workspace_dirs else None,
+        )
         if image_assets:
             snapshot["imageAssets"] = image_assets
 

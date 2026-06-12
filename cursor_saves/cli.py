@@ -1622,11 +1622,23 @@ def cmd_purge(args):
         return
 
     if ws_filter:
-        ws_filter_lower = ws_filter.lower()
-        all_chats = [
-            c for c in all_chats
-            if ws_filter_lower in c["workspace_label"].lower()
-        ]
+        ws = paths.resolve_workspace(ws_filter)
+        if ws:
+            ws_dir_str = str(ws["workspace_dir"])
+            ws_path_lower = ws["path"].lower()
+            all_chats = [
+                c for c in all_chats
+                if c.get("workspace_dir") == ws_dir_str
+                or ws_path_lower in c.get("workspace_dir", "").lower()
+                or ws_filter.lower() in c["workspace_label"].lower()
+            ]
+        else:
+            ws_filter_lower = ws_filter.lower()
+            all_chats = [
+                c for c in all_chats
+                if ws_filter_lower in c["workspace_label"].lower()
+                or ws_filter_lower in c.get("workspace_dir", "").lower()
+            ]
         if not all_chats:
             print(f"  No chats matching workspace '{ws_filter}'.")
             return

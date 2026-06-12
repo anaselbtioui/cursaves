@@ -10,6 +10,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
 _WORKSPACE_IMAGE_FILE_RE = re.compile(
     r'(?:[A-Za-z]:[\\/]|/)[^\s"]*?[/\\]workspaceStorage[/\\][^/\\"\s]+[/\\]images[/\\]([^/\\"\s]+\.(?:png|jpe?g|gif|webp))',
     re.IGNORECASE,
@@ -52,12 +54,55 @@ def extract_image_filenames(data: Any) -> set[str]:
     return filenames
 
 
-def collect_image_assets(snapshot: dict) -> dict[str, str]:
+def extract_image_uuids(data: Any) -> set[str]:
+    """Collect image UUIDs from bubble images[] entries and selectedImages."""
+    found: set[str] = set()
+
+    if isinstance(data, dict):
+        uuid = data.get("uuid")
+        if isinstance(uuid, str) and (
+            "dimension" in data
+            or (isinstance(data.get("path"), str) and re.search(r"[/\\]images[/\\]", data["path"], re.IGNORECASE))
+        ):
+            found.add(uuid)
+        for value in data.values():
+            found |= extract_image_uuids(value)
+    elif isinstance(data, list):
+        for item in data:
+            found |= extract_image_uuids(item)
+
+    return found
+
+
+def _resolve_uuid_files(images_dir: Path, uuid: str) -> list[Path]:
+    """Find image files in a workspace images dir that match a UUID."""
+    matches: list[Path] = []
+    patterns = (
+        f"image-{uuid}*",
+        f"{uuid}*",
+        f"*{uuid}*",
+    )
+    for pattern in patterns:
+        for candidate in images_dir.glob(pattern):
+            if candidate.is_file() and candidate.suffix.lower() in _IMAGE_EXTS:
+                matches.append(candidate)
+    return matches
+
+
+def collect_image_assets(snapshot: dict, workspace_dir: Path | None = None) -> dict[str, str]:
     """Read referenced workspace image files and return {filename: base64}."""
-    paths_found = extract_image_paths(snapshot)
+    paths_found = {os.path.normpath(p) for p in extract_image_paths(snapshot)}
+
+    if workspace_dir is not None:
+        images_dir = workspace_dir / "images"
+        if images_dir.exists():
+            for uuid in extract_image_uuids(snapshot):
+                for candidate in _resolve_uuid_files(images_dir, uuid):
+                    paths_found.add(str(candidate))
+
     assets: dict[str, str] = {}
     for raw_path in paths_found:
-        file_path = Path(os.path.normpath(raw_path))
+        file_path = Path(raw_path)
         if not file_path.exists():
             continue
         assets[file_path.name] = base64.b64encode(file_path.read_bytes()).decode("ascii")
