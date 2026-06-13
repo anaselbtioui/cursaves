@@ -102,6 +102,32 @@ def uri_to_path(uri: str) -> str:
     return path
 
 
+def file_uri_from_path(path: str) -> str:
+    """Build a Cursor-style file:// URI from a path (platform-independent)."""
+    expanded = os.path.expanduser(path)
+    if re.match(r"^[A-Za-z]:", expanded):
+        normalized = os.path.normpath(expanded)
+        drive = normalized[0].lower()
+        rest = normalized[2:].replace("\\", "/")
+        if not rest.startswith("/"):
+            rest = "/" + rest
+        return f"file:///{drive}%3A{rest}"
+    if expanded.startswith("/"):
+        return f"file://{expanded}"
+    normalized = os.path.normpath(expanded).replace("\\", "/")
+    if normalized.startswith("/"):
+        return f"file://{normalized}"
+    return Path(normalized).as_uri()
+
+
+def _normalize_rewrite_path(path: str) -> str:
+    """Normalize a path for rewrite pairs without mangling Unix paths on Windows."""
+    expanded = os.path.expanduser(path)
+    if expanded.startswith("/"):
+        return expanded
+    return os.path.normpath(expanded)
+
+
 def path_to_uri(path: str) -> str:
     """Convert a local path to a file:// URI matching Cursor's encoding."""
     normalized = os.path.normpath(os.path.expanduser(path))
@@ -117,8 +143,8 @@ def path_to_uri(path: str) -> str:
 
 def path_rewrite_pairs(old_prefix: str, new_prefix: str) -> list[tuple[str, str]]:
     """Build (old, new) replacement pairs covering path and URI variants."""
-    old_norm = os.path.normpath(os.path.expanduser(old_prefix))
-    new_norm = os.path.normpath(os.path.expanduser(new_prefix))
+    old_norm = _normalize_rewrite_path(old_prefix)
+    new_norm = _normalize_rewrite_path(new_prefix)
     pairs: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -129,6 +155,10 @@ def path_rewrite_pairs(old_prefix: str, new_prefix: str) -> list[tuple[str, str]
 
     add(old_norm, new_norm)
     add(old_norm.replace("\\", "/"), new_norm.replace("\\", "/"))
+    try:
+        add(file_uri_from_path(old_norm), file_uri_from_path(new_norm))
+    except (OSError, ValueError):
+        pass
     try:
         add(path_to_uri(old_norm), path_to_uri(new_norm))
     except (OSError, ValueError):

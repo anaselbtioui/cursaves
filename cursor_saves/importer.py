@@ -153,6 +153,19 @@ def is_cursor_running() -> bool:
 
 _SKIP_REWRITE_KEYS = frozenset({"conversationState"})
 
+# composerData fields tied to source-machine agent crypto/state — cleared on cross-platform import.
+_CROSS_PLATFORM_COMPOSER_FIELDS_TO_CLEAR = (
+    "conversationState",
+    "blobEncryptionKey",
+    "originalFileStates",
+    "conversationCheckpointLastUpdatedAt",
+    "subagentComposerIds",
+    "capabilityContexts",
+    "promptContextUsageTree",
+    "agentBackend",
+    "applyAgentBackendTypeRestrictions",
+)
+
 
 def _rewrite_paths_once(data: Any, old_prefix: str, new_prefix: str) -> Any:
     """Apply a single old->new prefix replacement throughout nested data."""
@@ -305,13 +318,15 @@ def _reset_agent_continuation_state(
     Cursor starts fresh agent state on the next message.
     """
     reset_composer = dict(composer_data)
-    reset_composer.pop("conversationState", None)
+    for key in _CROSS_PLATFORM_COMPOSER_FIELDS_TO_CLEAR:
+        reset_composer.pop(key, None)
 
     reset_bubbles: dict = {}
     for bubble_id, bubble_data in bubble_entries.items():
-        if isinstance(bubble_data, dict) and bubble_data.get("checkpointId"):
+        if isinstance(bubble_data, dict):
             cleaned = dict(bubble_data)
             cleaned.pop("checkpointId", None)
+            cleaned.pop("capabilityContexts", None)
             reset_bubbles[bubble_id] = cleaned
         else:
             reset_bubbles[bubble_id] = bubble_data
