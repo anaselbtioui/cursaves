@@ -247,6 +247,78 @@ def _needs_cross_platform_path_refresh(data: Any, target_path: str) -> bool:
     return False
 
 
+def _path_os_family(path: str) -> str | None:
+    """Return 'windows' or 'unix' for a filesystem path, else None."""
+    expanded = os.path.expanduser(path)
+    if re.match(r"^[A-Za-z]:", expanded):
+        return "windows"
+    if expanded.startswith("/"):
+        return "unix"
+
+    normalized = os.path.normpath(expanded)
+    if re.match(r"^[A-Za-z]:[\\/]", normalized):
+        return "windows"
+    if normalized.startswith("/") or re.match(r"^[\\/]home[\\/]", normalized, re.IGNORECASE):
+        return "unix"
+    return None
+
+
+def _is_cross_platform_import(
+    source_path: str,
+    target_path: str,
+    snapshot: dict | None = None,
+) -> bool:
+    """True when importing between different OS path families (Windows ↔ Unix)."""
+    src = source_path or (snapshot or {}).get("sourceProjectPath", "")
+    if src and target_path:
+        src_family = _path_os_family(src)
+        tgt_family = _path_os_family(target_path)
+        if src_family and tgt_family:
+            return src_family != tgt_family
+
+    if snapshot and not (src and target_path):
+        source_machine = (snapshot.get("sourceMachine") or "").lower()
+        current = platform.system().lower()
+        if source_machine and current:
+            windows_names = {"windows", "win32", "win"}
+            unix_names = {"linux", "darwin", "macos", "mac", "freebsd"}
+            src_is_win = any(n in source_machine for n in windows_names)
+            src_is_unix = any(n in source_machine for n in unix_names)
+            cur_is_win = current in windows_names or current == "windows"
+            cur_is_unix = current in unix_names
+            if (src_is_win and cur_is_unix) or (src_is_unix and cur_is_win):
+                return True
+
+    return False
+
+
+def _reset_agent_continuation_state(
+    composer_data: dict,
+    bubble_entries: dict,
+    agent_blobs: dict,
+    checkpoints: dict,
+) -> tuple[dict, dict, dict, dict]:
+    """Drop opaque agent state that cannot continue across platforms.
+
+    Preserves readable history (headers + bubbles). Clears conversationState,
+    agentKv blob imports, checkpoints, and per-message checkpointId refs so
+    Cursor starts fresh agent state on the next message.
+    """
+    reset_composer = dict(composer_data)
+    reset_composer.pop("conversationState", None)
+
+    reset_bubbles: dict = {}
+    for bubble_id, bubble_data in bubble_entries.items():
+        if isinstance(bubble_data, dict) and bubble_data.get("checkpointId"):
+            cleaned = dict(bubble_data)
+            cleaned.pop("checkpointId", None)
+            reset_bubbles[bubble_id] = cleaned
+        else:
+            reset_bubbles[bubble_id] = bubble_data
+
+    return reset_composer, reset_bubbles, {}, {}
+
+
 def _refresh_snapshot_assets(
     snapshot_path: Path,
     snapshot: dict,
@@ -272,6 +344,7 @@ def _refresh_snapshot_assets(
     global_db_path = paths.get_global_db_path()
     blobs_restored = 0
     paths_refreshed = False
+    cross_platform = _is_cross_platform_import(source_path, target_path, snapshot)
 
     installed_images = images.install_image_assets(snapshot_path, composer_id, ws_dir)
     inline_assets = snapshot.get("imageAssets") or {}
@@ -285,25 +358,37 @@ def _refresh_snapshot_assets(
     global_cdb = db.CursorDB(global_db_path)
     try:
         local_data = global_cdb.get_json(f"composerData:{composer_id}") or composer_data
-        refs = _extract_agent_blob_ids(local_data)
-        to_write: list[tuple[str, bytes]] = []
-        for bid in refs:
-            if bid not in agent_blobs:
-                continue
-            key = f"agentKv:blob:{bid}"
-            if global_cdb.get_item_binary(key, table="cursorDiskKV") is None:
-                to_write.append((key, base64.b64decode(agent_blobs[bid])))
-        if to_write:
-            global_cdb.write_batch(to_write)
-            blobs_restored = len(to_write)
+        if not cross_platform:
+            refs = _extract_agent_blob_ids(local_data)
+            to_write: list[tuple[str, bytes]] = []
+            for bid in refs:
+                if bid not in agent_blobs:
+                    continue
+                key = f"agentKv:blob:{bid}"
+                if global_cdb.get_item_binary(key, table="cursorDiskKV") is None:
+                    to_write.append((key, base64.b64decode(agent_blobs[bid])))
+            if to_write:
+                global_cdb.write_batch(to_write)
+                blobs_restored = len(to_write)
 
         needs_paths = (
             bool(installed_images)
             or (source_path and source_path != target_path)
             or _needs_cross_platform_path_refresh(local_data, target_path)
         )
-        if not needs_paths:
+        if not needs_paths and not cross_platform:
             return blobs_restored, len(installed_images), False
+
+        if cross_platform:
+            print(
+                "  Reset agent continuation state for cross-platform sync",
+                flush=True,
+            )
+            composer_data, bubble_entries, agent_blobs, checkpoints = (
+                _reset_agent_continuation_state(
+                    composer_data, bubble_entries, agent_blobs, checkpoints
+                )
+            )
 
         refreshed = composer_data
         if source_path and source_path != target_path:
@@ -515,6 +600,17 @@ def import_snapshot(
     bubble_entries = snapshot.get("bubbleEntries", {})
     checkpoints = snapshot.get("checkpoints", {})
     agent_blobs = snapshot.get("agentBlobs", {})
+
+    if _is_cross_platform_import(source_path, target_path, snapshot):
+        print(
+            "  Reset agent state for cross-platform import (history preserved)",
+            flush=True,
+        )
+        composer_data, bubble_entries, agent_blobs, checkpoints = (
+            _reset_agent_continuation_state(
+                composer_data, bubble_entries, agent_blobs, checkpoints
+            )
+        )
 
     # ── Conflict check ──────────────────────────────────────────────
     global_db_path = paths.get_global_db_path()
